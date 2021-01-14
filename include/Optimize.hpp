@@ -1,11 +1,12 @@
 #pragma once
 #include <Eigen/Core>
+#include <Eigen/SVD>
 #include <vector>
 #include <unordered_set>
 #include <numeric>
 #include <iterator>
 #include <queue>
-//#include <iostream>
+#include <iostream>
 
 template <int _Dims>
 class Optimize {
@@ -25,6 +26,15 @@ public:
 
 private:
 
+    static int powint(int x, int p)//https://stackoverflow.com/a/1505791
+    {
+        if (p == 0) return 1;
+        if (p == 1) return x;
+        int tmp = powint(x, p/2);
+        if (p%2 == 0) return tmp * tmp;
+        else return x * tmp * tmp;
+    }
+
     struct Split {
         int dimension;
         int left_index;
@@ -37,7 +47,7 @@ private:
         std::vector<Split> splits;
         std::vector<int> elements;
 
-        bool getClass(const Eigen::MatrixXf & data, float threshold){
+        bool getClass(const Eigen::Matrix<float,-1,_Dims+1> & data, float threshold){
             int low = 0;
             for (auto ind : elements) {
                 if (data(ind,data.cols()-1) < threshold)
@@ -46,7 +56,7 @@ private:
             return ((float) low / (float) elements.size())<=0.5;
         };
 
-        void getBounds(const Eigen::MatrixXf & data, vars_type & min, vars_type & max){
+        void getBounds(const Eigen::Matrix<float,-1,_Dims+1> & data, vars_type & min, vars_type & max){
             for (auto split : splits){
                 float x_left = data(split.left_index,split.dimension);
                 float x_right = data(split.right_index,split.dimension);
@@ -72,20 +82,19 @@ private:
     int max_iterations_ = 10;
     float tolerance_ = 1e-6;
 
-    Eigen::MatrixXf data_;
+    Eigen::Matrix<float,-1,_Dims+1> data_;
+    Eigen::Matrix<float,_Dims,_Dims> householder_ = Eigen::Matrix<float,_Dims,_Dims>::Identity();
     
     //Sample randomly from bounds
-    Eigen::MatrixXf randSample(int n);
-    Eigen::MatrixXf randSampleLow(int n, const std::vector<vars_type> & mins, const std::vector<vars_type> & maxs);
+    Eigen::Matrix<float,-1,_Dims+1> randSample(int n);
+    Eigen::Matrix<float,-1,_Dims+1> randSampleLow(int n, const std::vector<vars_type> & mins, const std::vector<vars_type> & maxs);
 
     //Generates observations from random samples
     void generateData() {
         data_ = randSample(num_observations_); 
-        sortData(); 
     };
     void generateDataLow(const std::vector<vars_type> & mins, const std::vector<vars_type> & maxs) {
         data_ = randSampleLow(num_observations_, mins, maxs); 
-        sortData(); 
     };
 
     //Sorts along each dimension and stores permutation
@@ -116,16 +125,33 @@ typename Optimize<_Dims>::vars_type Optimize<_Dims>::run()
     generateData();
 
     //partition box
-    std::vector<int> v(125);
+    std::vector<int> v(num_observations_);
     std::iota(v.begin(),v.end(),0);
 
-    vars_type current_min = data_.block<1,_Dims>(0,0);
-    float current_min_f = funk_(current_min);
+    vars_type current_min = vars_type::Zero();
+    float current_min_f = std::numeric_limits<float>::max();
 
     for (int k = 0; k < max_iterations_; k++){
-        //TODO; Householder reflection
-
-
+        //PCA to find dominant direction of hyper-ellipse
+        Eigen::JacobiSVD<Eigen::Matrix<float,-1,_Dims>> svd(data_.block(0,0,num_observations_,_Dims), Eigen::ComputeThinU | Eigen::ComputeThinV);
+        svd.computeV();
+        vars_type dominant = svd.matrixV().template block<1,_Dims>(0,0).transpose();
+        //Get Householder transformation matrix
+        vars_type e1 = vars_type::Zero();
+        e1(0) = 1;
+        vars_type u = e1 - dominant;
+        u.matrix().normalize();
+        householder_ = Eigen::Matrix<float,_Dims,_Dims>::Identity() - 2*u.matrix() * u.matrix().transpose();
+        
+        //Apply Householder transformation
+        bool no_transform = false;
+        if (!std::isnan(householder_.norm()) && !std::isnan(data_.block(0,0,num_observations_,_Dims).norm())){
+            data_.block(0,0,num_observations_,_Dims) = data_.block(0,0,num_observations_,_Dims).matrix() * householder_.transpose();
+        } else {
+            no_transform = true;
+        }        
+        sortData();
+        
         std::queue<Partition> partition_queue;
         std::vector<Partition> terminal;
 
@@ -166,38 +192,61 @@ typename Optimize<_Dims>::vars_type Optimize<_Dims>::run()
 
         std::vector<vars_type> minimums;
         std::vector<vars_type> maximums;
+        //Find bounding box in new coordinates
+        //We have 2^_Dims corners
+        vars_type new_min = householder_.transpose() * min_bounds_.matrix();
+        vars_type new_max = householder_.transpose() * max_bounds_.matrix();
+        for(int i = 0; i < powint(2,_Dims); i++) {
+            vars_type corner;
+            for (int j = 0; j < _Dims; j++){
+                if (i & powint(2,j))
+                    corner(j) = max_bounds_(j);
+                else 
+                    corner(j) = min_bounds_(j);
+            }
+            vars_type corner_transformed = householder_.transpose() * corner.matrix();
+            for (int d = 0; d < _Dims; d++){
+                if (corner_transformed(d) < new_min(d))
+                    new_min(d) = corner_transformed(d);
+                if (corner_transformed(d) > new_max(d))
+                    new_max(d) = corner_transformed(d);
+            }
+        }
         for (auto t : terminal) {
             if (!t.getClass(data_,threshold_)){ //classified as low
-                auto min = min_bounds_;
-                auto max = max_bounds_;
+                vars_type min = new_min;
+                vars_type max = new_max;
                 t.getBounds(data_, min, max);
                 minimums.push_back(min);
                 maximums.push_back(max);
             }
         }
-
-        //TODO: Fit new bounding box to avoid sampling too many points outisde union
-
+ 
         //Randomly sample in union of low partitions
         generateDataLow(minimums,maximums);
-
-        //TODO: Inverse Householder reflection
+        
+        //Apply inverse Householder transformation
+        if (!no_transform){
+            data_.block(0,0,num_observations_,_Dims) = data_.block(0,0,num_observations_,_Dims).matrix() * householder_;
+        }
 
         for (int i = 0; i < num_observations_; i++){
+            //Calculate f for new batch of points
+            data_(i,_Dims) = funk_(data_.template block<1,_Dims>(i,0));
+            //Check if f is new minimum
             if (data_(i,_Dims) < current_min_f){
-                current_min = data_.block<1,_Dims>(i,0);
+                current_min = data_.template block<1,_Dims>(i,0);
                 current_min_f = data_(i,_Dims);
-            }
-                
+            } 
         }
     }
     return current_min;
 }
 
 template <int _Dims>
-Eigen::MatrixXf Optimize<_Dims>::randSample(int n)
+Eigen::Matrix<float,-1,_Dims+1> Optimize<_Dims>::randSample(int n)
 {
-    Eigen::MatrixXf samples;
+    Eigen::Matrix<float,-1,_Dims+1> samples;
     samples.resize(n,_Dims+1);
     for (int i = 0; i < n; i++){
         vars_type x = vars_type::Random();//between -1 and 1
@@ -205,32 +254,47 @@ Eigen::MatrixXf Optimize<_Dims>::randSample(int n)
         x /= 2;
         x *= max_bounds_-min_bounds_;
         x += min_bounds_;
-        samples.block<1,_Dims>(i,0) = x;
+        samples.template block<1,_Dims>(i,0) = x;
         samples(i,_Dims) = funk_(x);
     }
     return samples;
 }
 
 template <int _Dims>
-Eigen::MatrixXf Optimize<_Dims>::randSampleLow(int n, const std::vector<vars_type> & mins, const std::vector<vars_type> & maxs)
+Eigen::Matrix<float,-1,_Dims+1> Optimize<_Dims>::randSampleLow(int n, const std::vector<vars_type> & mins, const std::vector<vars_type> & maxs)
 {
-    Eigen::MatrixXf samples;
+    Eigen::Matrix<float,-1,_Dims+1> samples;
     samples.resize(n,_Dims+1);
+
+    //Create a new bounding box on which to sample
+    // vars_type new_min_bounds = mins[0];
+    // vars_type new_max_bounds = maxs[0];
+    vars_type new_min_bounds = mins[0];
+    vars_type new_max_bounds = maxs[0];
+
+    for (int i = 1; i < mins.size(); i++){
+        for (int d = 0; d < _Dims; d++){
+            if (mins[i](d) < new_min_bounds(d))
+                new_min_bounds(d) = mins[i](d);
+            if (maxs[i](d) > new_max_bounds(d))
+                new_max_bounds(d) = maxs[i](d);
+        }
+    }
+
     for (int i = 0; i < n; i++){
         vars_type x = vars_type::Random();//between -1 and 1
         x += 1;
         x /= 2;
-        x *= max_bounds_-min_bounds_;
-        x += min_bounds_;
+        x *= new_max_bounds-new_min_bounds;
+        x += new_min_bounds;
         while (!withinUnion(x, mins, maxs)){
             x = vars_type::Random();//between -1 and 1
             x += 1;
             x /= 2;
-            x *= max_bounds_-min_bounds_;
-            x += min_bounds_;
+            x *= new_max_bounds-new_min_bounds;
+            x += new_min_bounds;
         }
-        samples.block<1,_Dims>(i,0) = x;
-        samples(i,_Dims) = funk_(x);
+        samples.template block<1,_Dims>(i,0)= x;
     }
     return samples;
 }
